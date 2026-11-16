@@ -49,6 +49,7 @@ const PALETTE = ["#3E7A6A","#9FB0A8","#5E7FA0","#8C5A5A","#7A8C4E","#A0806A","#6
 const KEY = "hronometr.v1";
 const S = { st: null, days: {}, tab: "track", draft: { c: "", p: "", note: "", newC: "", newP: "" }, shown: 30, storageOk: true };
 /* Everything read from storage or a backup file is untrusted: keep only known fields of the right type. */
+const SCRIPT_RE = /^https:\/\/script\.google\.com\/macros\/s\/[\w-]{20,200}\/exec$/;
 const str = (v, max) => (typeof v === "string" ? v : typeof v === "number" && Number.isFinite(v) ? String(v) : "").slice(0, max);
 const num = v => (typeof v === "number" && Number.isFinite(v) ? v : typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v) ? Number(v) : 0);
 const safeId = v => (typeof v === "string" && /^[A-Za-z0-9_-]{1,40}$/.test(v) ? v : "");
@@ -77,9 +78,8 @@ function cleanDays(days) {
 function cleanGoogle(g) {
   g = g || {};
   return {
-    clientId: /^[\w.-]{1,200}\.apps\.googleusercontent\.com$/.test(str(g.clientId, 300).trim()) ? str(g.clientId, 300).trim() : str(g.clientId, 300).replace(/[^\w.-]/g, ""),
-    sheetId: /^[\w-]{10,100}$/.test(g.sheetId || "") ? g.sheetId : "",
-    sheetUrl: /^https:\/\/docs\.google\.com\/spreadsheets\//.test(g.sheetUrl || "") ? g.sheetUrl : "",
+    scriptUrl: SCRIPT_RE.test(g.scriptUrl || "") ? g.scriptUrl : "",
+    secret: /^[A-Za-z0-9]{24,64}$/.test(g.secret || "") ? g.secret : "",
     lastExport: num(g.lastExport),
   };
 }
@@ -492,105 +492,86 @@ function restore(file) {
   rd.readAsText(file);
 }
 
-/* ---------- Google Sheets API ---------- */
-const SCOPE = "https://www.googleapis.com/auth/drive.file";
-const SHEET = "Записи";
-let gisP = null, token = null, tokenExp = 0;
-function loadGis() {
-  if (window.google?.accounts?.oauth2) return Promise.resolve();
-  if (gisP) return gisP;
-  gisP = new Promise((res, rej) => {
-    const s = document.createElement("script"); s.src = "https://accounts.google.com/gsi/client"; s.async = true;
-    s.onload = res; s.onerror = () => { gisP = null; rej(new Error("gis")); };
-    document.head.append(s);
-  });
-  return gisP;
-}
-function getToken() {
-  if (token && Date.now() < tokenExp - 60000) return Promise.resolve(token);
-  return new Promise((res, rej) => {
-    const client = google.accounts.oauth2.initTokenClient({
-      client_id: S.st.google.clientId.trim(), scope: SCOPE,
-      callback: r => { if (r.error) rej(new Error(r.error)); else { token = r.access_token; tokenExp = Date.now() + (Number(r.expires_in) || 3600) * 1000; res(token); } },
-      error_callback: e => rej(new Error(e?.type || "popup")),
-    });
-    client.requestAccessToken();
-  });
-}
-async function gapi(method, url, body) {
-  const r = await fetch(url, { method, headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
-  if (!r.ok) { let msg = ""; try { msg = (await r.json())?.error?.message || ""; } catch {} const e = new Error(msg || "HTTP " + r.status); e.status = r.status; throw e; }
-  return r.json();
-}
-const safeCell = v => (typeof v === "string" && /^[=+\-@\t\r]/.test(v) ? "'" + v : v);
-async function exportToSheets(statusEl, auto) {
-  const say = (t, color) => { statusEl.style.color = color || ""; statusEl.textContent = t; };
-  if (!S.st.google.clientId.trim()) { say("Сначала вставьте Client ID — инструкция ниже.", "var(--bad)"); return; }
-  if (location.protocol === "file:") { say("Выгрузка работает только когда приложение открыто с сайта (https://…), а не из файла на компьютере.", "var(--bad)"); return; }
-  try { say("Подключаюсь к Google…"); await loadGis(); }
-  catch { say("Не удалось загрузить вход Google. Проверьте интернет и что блокировщик рекламы не мешает accounts.google.com.", "var(--bad)"); return; }
-  try { await getToken(); }
-  catch (e) {
-    const m = String(e.message || "");
-    say(m.includes("popup") ? "Окно входа Google закрыто или заблокировано. Разрешите всплывающие окна для этого сайта и повторите." :
-      m.includes("access_denied") ? "Вы не дали доступ к Google Диску — без него таблицу не создать." :
-      `Google не пустил: ${m}. Проверьте Client ID и что адрес сайта добавлен в «Authorized JavaScript origins».`, "var(--bad)");
-    return;
-  }
-  const rows = rowsForExport();
-  const values = [HEAD, ...rows.map(r => [r.date, r.s, r.e, r.min, Math.round(r.min / 60 * 100) / 100, safeCell(r.c), safeCell(r.p), safeCell(r.note)])];
+/* ---------- Google Sheets through a small script inside the user's own table ----------
+   The table runs a script (Apps Script web app) that accepts the records and writes them
+   to the sheet «Записи». No Google Cloud project and no sign-in window are needed.
+   The script accepts data only together with the key stored in this browser. */
+function newSecret() { const abc = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"; const a = new Uint32Array(32); crypto.getRandomValues(a); return [...a].map(x => abc[x % abc.length]).join(""); }
+function ensureSecret() { if (!S.st.google.secret) { S.st.google.secret = newSecret(); saveState(); } return S.st.google.secret; }
+function scriptCode(key) {
+  return `// Хронометр → эта таблица. Вставьте этот код целиком в «Расширения → Apps Script».
+// Ключ ниже знает только ваш Хронометр: без него скрипт ничего не запишет.
+const KEY = '${key}';
+const SHEET = 'Записи';
+
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
   try {
-    let id = S.st.google.sheetId;
-    if (id) {
-      try { await gapi("GET", `https://sheets.googleapis.com/v4/spreadsheets/${id}?fields=spreadsheetId`); }
-      catch (e) { if (e.status === 404 || e.status === 403) id = ""; else throw e; }
-    }
-    if (!id) {
-      say("Создаю таблицу «Хронометр» на вашем Google Диске…");
-      const ss = await gapi("POST", "https://sheets.googleapis.com/v4/spreadsheets", {
-        properties: { title: "Хронометр", locale: "ru_RU", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Europe/Moscow" },
-        sheets: [{ properties: { title: SHEET, gridProperties: { frozenRowCount: 1 } } }],
-      });
-      id = ss.spreadsheetId;
-      S.st.google.sheetId = id; S.st.google.sheetUrl = ss.spreadsheetUrl; saveState();
-      const sheetId = ss.sheets?.[0]?.properties?.sheetId ?? 0;
-      await gapi("POST", `https://sheets.googleapis.com/v4/spreadsheets/${id}:batchUpdate`, { requests: [
-        { repeatCell: { range: { sheetId, startRowIndex: 0, endRowIndex: 1 }, cell: { userEnteredFormat: { textFormat: { bold: true } } }, fields: "userEnteredFormat.textFormat.bold" } },
-        { repeatCell: { range: { sheetId, startRowIndex: 1, startColumnIndex: 0, endColumnIndex: 1 }, cell: { userEnteredFormat: { numberFormat: { type: "DATE", pattern: "dd.mm.yyyy" } } }, fields: "userEnteredFormat.numberFormat" } },
-      ] }).catch(() => {});
-    }
-    say(`Записываю ${rows.length} записей…`);
-    const range = encodeURIComponent(`'${SHEET}'!A:H`);
-    await gapi("POST", `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${range}:clear`, {});
-    await gapi("PUT", `https://sheets.googleapis.com/v4/spreadsheets/${id}/values/${encodeURIComponent(`'${SHEET}'!A1`)}?valueInputOption=USER_ENTERED`, { values });
-    S.st.google.lastExport = Date.now(); saveState();
-    statusEl.innerHTML = "";
-    statusEl.style.color = "";
-    statusEl.append(h("span", { style: "color:var(--good);font-weight:600" }, `Готово: ${rows.length} записей. `),
-      h("a", { href: S.st.google.sheetUrl || `https://docs.google.com/spreadsheets/d/${id}/edit`, target: "_blank", rel: "noopener", style: "font-weight:600" }, "Открыть таблицу"));
-  } catch (e) {
-    if (e.status === 401) { token = null; say("Доступ к Google истёк. Нажмите «Выгрузить» ещё раз.", "var(--bad)"); }
-    else if (e.status === 403 && /has not been used|disabled/i.test(e.message)) say("В проекте Google Cloud не включён Google Sheets API. Включите его (шаг 2 инструкции) и повторите через минуту.", "var(--bad)");
-    else say(`Не получилось выгрузить: ${e.message || "ошибка сети"}. Повторите позже.`, "var(--bad)");
+    const data = JSON.parse(e.postData.contents);
+    if (data.key !== KEY) return reply({ ok: false, error: 'wrong key' });
+    const rows = data.rows;
+    if (!Array.isArray(rows) || !rows.length) return reply({ ok: false, error: 'no rows' });
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(SHEET) || ss.insertSheet(SHEET);
+    sh.clearContents();
+    sh.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+    sh.setFrozenRows(1);
+    sh.getRange(1, 1, 1, rows[0].length).setFontWeight('bold');
+    return reply({ ok: true, count: rows.length - 1 });
+  } catch (err) {
+    return reply({ ok: false, error: String(err) });
+  } finally {
+    lock.releaseLock();
   }
 }
 
-/* ---------- automatic Google Sheets update ----------
-   After any change to the entries, the sheet is rewritten a few seconds later,
-   but only while the Google sign-in from the last manual update is still valid
-   (about an hour): browsers do not allow a sign-in window without a click. */
-let syncT = null, syncFailed = false;
+// Открыв адрес скрипта в браузере, вы увидите только эту строку — данных он не отдаёт.
+function doGet() { return reply({ ok: true, app: 'Хронометр' }); }
+
+function reply(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
+`;
+}
+const safeCell = v => (typeof v === "string" && /^[=+\-@\t\r]/.test(v) ? "'" + v : v);
+function sheetRows() {
+  return [HEAD, ...rowsForExport().map(r => [r.date, r.s, r.e, r.min, Math.round(r.min / 60 * 100) / 100, safeCell(r.c), safeCell(r.p), safeCell(r.note)])];
+}
+async function pushToSheet() {
+  const g = S.st.google;
+  if (!SCRIPT_RE.test(g.scriptUrl)) return { ok: false, error: "Сначала вставьте адрес скрипта (заканчивается на /exec)." };
+  const rows = sheetRows();
+  const body = JSON.stringify({ key: ensureSecret(), rows });
+  try {
+    // Plain-text body: the browser sends it without a preflight request, which Apps Script cannot answer.
+    const r = await fetch(g.scriptUrl, { method: "POST", body, redirect: "follow", credentials: "omit" });
+    let d = null; try { d = await r.json(); } catch {}
+    if (!d) return { ok: false, error: "Скрипт ответил не так, как ожидалось. Проверьте, что в развёртывании выбрано «У кого есть доступ: Все»." };
+    if (!d.ok) return { ok: false, error: d.error === "wrong key" ? "Ключ в скрипте не совпадает с этим Хронометром. Скопируйте код скрипта заново и обновите развёртывание." : "Ошибка в таблице: " + str(d.error, 200) };
+    g.lastExport = Date.now(); saveState(); return { ok: true, count: d.count };
+  } catch {
+    // If the browser could not read the answer, send once more without reading it.
+    try { await fetch(g.scriptUrl, { method: "POST", body, mode: "no-cors", credentials: "omit" }); g.lastExport = Date.now(); saveState(); return { ok: true, unconfirmed: true, count: rows.length - 1 }; }
+    catch { return { ok: false, error: "Нет связи с Google. Проверьте интернет и повторите." }; }
+  }
+}
+
+/* ---------- automatic update: a few seconds after any change to the records ---------- */
+let syncT = null, syncFailed = false, syncRunning = false, syncAgain = false;
 function scheduleSync() {
   clearTimeout(syncT);
-  if (!S.st.google.sheetId || !token || Date.now() > tokenExp - 60000) return;
-  syncT = setTimeout(async () => {
-    if (!token || Date.now() > tokenExp - 60000) return;
-    const st = h("div");
-    await exportToSheets(st, true);
-    const ok = !st.style.color;
-    if (!ok && !syncFailed) toast("Google Таблица не обновилась — нажмите «Обновить таблицу» в разделе данных");
-    syncFailed = !ok;
-  }, 4000);
+  if (!S.st.google.scriptUrl) return;
+  syncT = setTimeout(runSync, 4000);
+}
+async function runSync() {
+  if (syncRunning) { syncAgain = true; return; }
+  syncRunning = true;
+  const r = await pushToSheet();
+  syncRunning = false;
+  if (!r.ok && !syncFailed) toast("Google Таблица не обновилась: " + r.error);
+  syncFailed = !r.ok;
+  if (syncAgain) { syncAgain = false; runSync(); }
 }
 
 /* ---------- reports ---------- */
@@ -699,30 +680,42 @@ function dayChart(days, vals) {
 /* ---------- settings / data modal ---------- */
 function openSettings() {
   const g = S.st.google;
-  const cid = h("input", { type: "text", id: "g-cid", placeholder: "xxxxxxxx.apps.googleusercontent.com", value: g.clientId, autocomplete: "off", spellcheck: "false" });
-  cid.addEventListener("change", () => { g.clientId = cid.value.trim(); token = null; saveState(); });
+  const key = ensureSecret();
+  const url = h("input", { type: "text", id: "g-url", placeholder: "https://script.google.com/macros/s/…/exec", value: g.scriptUrl, autocomplete: "off", spellcheck: "false" });
   const status = h("div", { class: "note", role: "status" },
-    g.lastExport ? ["Последняя выгрузка: " + fmtDate(g.lastExport) + " " + fmtTime(g.lastExport) + ". ", g.sheetUrl && h("a", { href: g.sheetUrl, target: "_blank", rel: "noopener" }, "Открыть таблицу")] : "");
-  const go = h("button", { class: "btn primary", id: "g-go" }, g.sheetId ? "Обновить таблицу" : "Выгрузить в Google Таблицу");
-  go.addEventListener("click", async () => { g.clientId = cid.value.trim(); saveState(); go.disabled = true; await exportToSheets(status); go.disabled = false; go.textContent = "Обновить таблицу"; });
+    g.scriptUrl ? (g.lastExport ? `Подключено. Последняя отправка: ${fmtDate(g.lastExport)} ${fmtTime(g.lastExport)}.` : "Подключено, отправок ещё не было.") : "");
+  const say = (text, bad) => { status.style.color = bad ? "var(--bad)" : ""; status.textContent = text; };
+  const go = h("button", { class: "btn primary", id: "g-go" }, g.scriptUrl ? "Отправить сейчас" : "Подключить и отправить");
+  go.addEventListener("click", async () => {
+    const v = url.value.trim();
+    if (!SCRIPT_RE.test(v)) { say("Это не адрес веб-приложения Apps Script. Он начинается с https://script.google.com/macros/s/ и заканчивается на /exec.", true); return; }
+    g.scriptUrl = v; saveState(); go.disabled = true; say("Отправляю записи в таблицу…");
+    const r = await pushToSheet(); go.disabled = false;
+    if (r.ok) { go.textContent = "Отправить сейчас"; syncFailed = false; say(r.unconfirmed ? `Отправлено ${r.count} записей. Браузер не показал ответ таблицы — откройте её и проверьте лист «Записи».` : `Готово: в таблице ${r.count} записей. Дальше она будет обновляться сама.`); }
+    else say(r.error, true);
+  });
+  const copyCode = h("button", { class: "btn", id: "g-copy" }, "Скопировать код скрипта");
+  const codeBox = h("textarea", { id: "g-code", readonly: true, style: "font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;min-height:120px", "aria-label": "Код скрипта" }, scriptCode(key));
+  copyCode.addEventListener("click", async () => { try { await navigator.clipboard.writeText(codeBox.value); toast("Код скопирован"); } catch { codeBox.hidden = false; codeBox.focus(); codeBox.select(); toast("Выделите код и скопируйте вручную"); } });
+  codeBox.hidden = true;
+  const off = g.scriptUrl ? h("button", { class: "btn ghost", onclick: () => { g.scriptUrl = ""; saveState(); toast("Таблица отключена"); openSettings(); } }, "Отключить") : null;
   const file = h("input", { type: "file", id: "restore-file", accept: "application/json,.json", hidden: true });
   file.addEventListener("change", () => { if (file.files[0]) restore(file.files[0]); file.value = ""; });
-  const origin = location.protocol.startsWith("http") ? location.origin : "https://ваш-адрес.github.io";
   const n = allEntries().length;
+  const steps = h("ol", { class: "note" },
+    h("li", null, "Создайте Google Таблицу (или откройте ту, где нужны записи) → меню ", h("b", null, "«Расширения» → «Apps Script»"), "."),
+    h("li", null, "Удалите всё в редакторе, нажмите здесь ", h("b", null, "«Скопировать код скрипта»"), ", вставьте и сохраните."),
+    h("li", null, h("b", null, "«Начать развёртывание» → «Новое развёртывание»"), " → шестерёнка → «Веб-приложение». «Запуск от имени»: ", h("b", null, "Я"), ", «У кого есть доступ»: ", h("b", null, "Все"), ". Нажмите «Начать развёртывание» и разрешите доступ к таблице."),
+    h("li", null, "Скопируйте ", h("b", null, "URL веб-приложения"), " (заканчивается на /exec), вставьте ниже и нажмите «Подключить и отправить»."));
   const body = h("div", { style: "display:grid;gap:18px" },
     h("div", { class: "sect" },
       h("h3", null, "Google Таблица"),
-      h("p", { class: "note" }, "Все записи выгружаются в одну таблицу «Хронометр» на вашем Google Диске. Лист «Записи» каждый раз перезаписывается целиком — правки там не сохраняются, свои расчёты делайте на других листах."),
-      h("p", { class: "note" }, "После нажатия «Обновить таблицу» примерно час таблица обновляется сама после каждой новой, изменённой или удалённой записи. Потом Google просит войти снова — просто нажмите кнопку ещё раз."),
-      h("label", { class: "field" }, h("span", null, "Client ID из Google Cloud"), cid),
-      h("div", { class: "row" }, go), status,
-      h("details", null, h("summary", { style: "cursor:pointer;font-size:14px;color:var(--text-muted)" }, "Как получить Client ID (один раз, ~10 минут)"),
-        h("ol", { class: "note", style: "margin-top:10px" },
-          h("li", null, "Откройте ", h("a", { href: "https://console.cloud.google.com/projectcreate", target: "_blank", rel: "noopener" }, "console.cloud.google.com"), " и создайте проект, например «Хронометр»."),
-          h("li", null, "В разделе «APIs & Services → Library» найдите ", h("b", null, "Google Sheets API"), " и нажмите Enable."),
-          h("li", null, "«Google Auth Platform → Branding»: заполните название и e-mail. В «Audience» выберите External и добавьте свой e-mail в Test users."),
-          h("li", null, "«Clients → Create client»: тип ", h("b", null, "Web application"), ". В «Authorized JavaScript origins» добавьте ", h("code", null, origin), "."),
-          h("li", null, "Скопируйте Client ID и вставьте в поле выше. При первой выгрузке Google спросит разрешение на доступ к файлам, созданным этим приложением.")))),
+      h("p", { class: "note" }, "Записи сами отправляются в вашу Google Таблицу через небольшой скрипт внутри неё — через несколько секунд после каждой новой, изменённой или удалённой записи. Лист «Записи» каждый раз перезаписывается целиком, свои расчёты делайте на других листах."),
+      g.scriptUrl ? h("details", null, h("summary", { style: "cursor:pointer;font-size:14px;color:var(--text-muted)" }, "Как подключить (если нужно заново)"), h("div", { style: "display:grid;gap:10px;margin-top:10px" }, steps, h("div", { class: "row" }, copyCode), codeBox))
+        : h("div", { style: "display:grid;gap:10px" }, steps, h("div", { class: "row" }, copyCode), codeBox),
+      h("label", { class: "field" }, h("span", null, "адрес скрипта"), url),
+      h("div", { class: "row" }, go, off), status,
+      h("p", { class: "note" }, "«Доступ: Все» нужен, чтобы Хронометр мог достучаться до скрипта. Записать что-то в таблицу можно только с ключом, который хранится в этом браузере, а прочитать данные через скрипт нельзя никому.")),
     h("div", { class: "sect" },
       h("h3", null, "Резервная копия"),
       h("p", { class: "note" }, `Записи (${n}) хранятся только в этом браузере на этом устройстве. Сохраняйте копию время от времени — из неё можно восстановить данные или перенести их на другое устройство.` + (S.st.lastBackup ? ` Последняя копия: ${fmtDate(S.st.lastBackup)}.` : "")),

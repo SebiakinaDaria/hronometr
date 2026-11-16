@@ -1,5 +1,5 @@
 // Хронометр: keeps the app files available offline. The records themselves live in localStorage.
-const CACHE = "hronometr-v4";
+const CACHE = "hronometr-v5";
 const SHELL = ["./", "index.html", "app.js", "manifest.webmanifest", "fonts/onest.woff", "fonts/prata.woff",
   "icon-180.png", "icon-192.png", "icon-512.png", "mark.svg", "logo-light.svg", "logo-dark.svg"];
 
@@ -11,7 +11,7 @@ self.addEventListener("activate", ev => {
 });
 self.addEventListener("fetch", ev => {
   const url = new URL(ev.request.url);
-  // Only this site's own files are cached; Google sign-in and Sheets always go straight to the network.
+  // Only this site's own files are cached; requests to the Google Sheets script always go straight to the network.
   if (ev.request.method !== "GET" || url.origin !== location.origin) return;
   ev.respondWith(fetch(ev.request).then(r => {
     if (r.ok && r.type === "basic") { const copy = r.clone(); caches.open(CACHE).then(c => c.put(ev.request, copy)); }
