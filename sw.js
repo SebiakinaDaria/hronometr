@@ -1,5 +1,5 @@
 // Хронометр: keeps the app files available offline. The records themselves live in localStorage.
-const CACHE = "hronometr-v5";
+const CACHE = "hronometr-v6";
 const SHELL = ["./", "index.html", "app.js", "manifest.webmanifest", "fonts/onest.woff", "fonts/prata.woff",
   "icon-180.png", "icon-192.png", "icon-512.png", "mark.svg", "logo-light.svg", "logo-dark.svg"];
 

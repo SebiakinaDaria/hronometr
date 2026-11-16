@@ -57,7 +57,7 @@ const safeColor = v => (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v) ? v
 function cleanItem(x, withColor) {
   const id = safeId(x?.id); if (!id) return null;
   const o = { id, name: str(x.name, 80) || "Без названия", archived: !!x.archived, order: num(x.order) };
-  if (withColor) o.color = safeColor(x.color);
+  if (withColor) { o.color = safeColor(x.color); o.cats = (Array.isArray(x.cats) ? x.cats : []).map(safeId).filter(Boolean).slice(0, 300); }
   return o;
 }
 function cleanEntry(e) {
@@ -137,6 +137,16 @@ const pName = id => prj(id)?.name || "Без проекта";
 const pColor = id => prj(id)?.color || "#8A94B3";
 const active = list => list.filter(x => !x.archived).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 const archived = list => list.filter(x => x.archived).sort((a, b) => a.name.localeCompare(b.name, "ru"));
+/* Activities offered for a project: the ones ticked for it, or all of them when nothing is ticked. */
+function allowedCats(pid) {
+  const all = active(S.st.categories);
+  const p = prj(pid); const ids = p?.cats || [];
+  if (!ids.length) return all;
+  const set = new Set(ids); const list = all.filter(c => set.has(c.id));
+  return list.length ? list : all;
+}
+const isAllowed = (pid, cid) => allowedCats(pid).some(c => c.id === cid);
+function linkCat(pid, cid) { const p = prj(pid); if (p && p.cats.length && !p.cats.includes(cid)) { p.cats.push(cid); saveState(); } }
 const sameName = (list, name, exceptId) => list.find(x => x.id !== exceptId && x.name.trim().toLowerCase() === name.trim().toLowerCase());
 function createCategory(name) {
   const ex = sameName(S.st.categories, name);
@@ -149,7 +159,7 @@ function createProject(name) {
   if (ex) { if (ex.archived) { ex.archived = false; saveState(); toast(`«${ex.name}» возвращён из архива`); } return ex.id; }
   const used = S.st.projects.map(p => p.color);
   const color = PALETTE.find(c => !used.includes(c)) || PALETTE[S.st.projects.length % PALETTE.length];
-  const x = { id: uid(), name: name.trim().slice(0, 80), color, archived: false, order: S.st.projects.length };
+  const x = { id: uid(), name: name.trim().slice(0, 80), color, archived: false, order: S.st.projects.length, cats: [] };
   S.st.projects.push(x); saveState(); return x.id;
 }
 
@@ -158,10 +168,10 @@ function resolvePick(d) {
   let c = d.c, p = d.p;
   if (c === "__new" && !d.newC.trim()) return { err: "Введите название новой категории" };
   if (p === "__new" && !d.newP.trim()) return { err: "Введите название нового проекта" };
-  if (!c) return { err: "Выберите категорию активности" };
   if (!p) return { err: "Выберите проект" };
-  if (c === "__new") c = createCategory(d.newC);
+  if (!c) return { err: "Выберите категорию активности" };
   if (p === "__new") p = createProject(d.newP);
+  if (c === "__new") { c = createCategory(d.newC); linkCat(p, c); }
   return { c, p };
 }
 function startTimer() {
@@ -215,13 +225,24 @@ function confirmBox(title, text, okLabel) {
   });
 }
 
-function catSelect(id, value, withNew) {
-  const el = h("select", { id },
-    h("option", { value: "" }, "— выберите категорию —"),
-    active(S.st.categories).map(x => h("option", { value: x.id }, x.name)),
-    value && cat(value)?.archived && h("option", { value }, cName(value) + " (в архиве)"),
-    withNew && h("option", { value: "__new" }, "+ Новая категория…"));
-  el.value = value || ""; return el;
+function fillCats(el, pid, value, withNew) {
+  const list = pid && pid !== "__new" ? allowedCats(pid) : active(S.st.categories);
+  el.innerHTML = "";
+  el.append(h("option", { value: "" }, "— выберите категорию —"));
+  for (const x of list) el.append(h("option", { value: x.id }, x.name));
+  if (value && value !== "__new" && cat(value) && !list.some(x => x.id === value))
+    el.append(h("option", { value }, cName(value) + (cat(value).archived ? " (в архиве)" : " (не из этого проекта)")));
+  if (withNew) el.append(h("option", { value: "__new" }, "+ Новая категория…"));
+  el.value = value || "";
+  if (el.value !== (value || "")) el.value = "";
+  return list;
+}
+function catSelect(id, value, withNew, pid) { const el = h("select", { id }); fillCats(el, pid, value, withNew); return el; }
+/* after the project changes: keep the activity if it fits, pick the only one if there is just one, otherwise ask */
+function pickForProject(pid, cid) {
+  const list = pid && pid !== "__new" ? allowedCats(pid) : active(S.st.categories);
+  if (cid === "__new" || list.some(x => x.id === cid)) return cid;
+  return list.length === 1 ? list[0].id : "";
 }
 function prjSelect(id, value, withNew) {
   const el = h("select", { id },
@@ -240,7 +261,8 @@ function openEditor(entry) {
   const e = entry ? { ...entry } : { id: uid(), c: S.st.last?.c || "", p: S.st.last?.p || "", s: now - HOUR, e: now, note: "" };
   if (e.c && !cat(e.c)) e.c = ""; if (e.p && !prj(e.p)) e.p = "";
   if (isNew) { if (e.c && cat(e.c).archived) e.c = ""; if (e.p && prj(e.p).archived) e.p = ""; }
-  const cs = catSelect("ed-c", e.c), ps = prjSelect("ed-p", e.p);
+  const ps = prjSelect("ed-p", e.p), cs = catSelect("ed-c", e.c, false, e.p);
+  ps.addEventListener("change", () => { fillCats(cs, ps.value, pickForProject(ps.value, cs.value), false); });
   const date = h("input", { type: "date", id: "ed-date", value: dkey(e.s) });
   const st = h("input", { type: "time", id: "ed-s", value: fmtTime(e.s) });
   const en = h("input", { type: "time", id: "ed-e", value: fmtTime(e.e) });
@@ -256,7 +278,7 @@ function openEditor(entry) {
   const upd = () => { const r = calc(); dur.textContent = r ? `Длительность: ${fmtDur(r.e - r.s)}${dkey(r.e - 1) !== dkey(r.s) ? " · заканчивается на следующий день" : ""}` : ""; };
   [date, st, en].forEach(x => x.addEventListener("input", upd)); upd();
   const body = h("div", { style: "display:grid;gap:14px" },
-    h("div", { class: "picks" }, h("label", { class: "field" }, h("span", null, "категория активности"), cs), h("label", { class: "field" }, h("span", null, "проект"), ps)),
+    h("div", { class: "picks" }, h("label", { class: "field" }, h("span", null, "проект"), ps), h("label", { class: "field" }, h("span", null, "категория активности"), cs)),
     h("div", { class: "grid3" },
       h("label", { class: "field" }, h("span", null, "дата"), date),
       h("label", { class: "field" }, h("span", null, "начало"), st),
@@ -270,8 +292,8 @@ function openEditor(entry) {
     h("span", { class: "sp" }),
     h("button", { class: "btn ghost", onclick: () => close() }, "Отмена"),
     h("button", { class: "btn primary", id: "ed-save", onclick: () => {
-      if (!cs.value) { err.textContent = "Выберите категорию активности"; return; }
       if (!ps.value) { err.textContent = "Выберите проект"; return; }
+      if (!cs.value) { err.textContent = "Выберите категорию активности"; return; }
       const r = calc(); if (!r) { err.textContent = "Укажите дату, начало и окончание"; return; }
       if (r.e - r.s > 24 * HOUR) { err.textContent = "Запись не может быть длиннее суток"; return; }
       if (r.e > Date.now() + MIN) { err.textContent = "Окончание не может быть в будущем"; return; }
@@ -321,9 +343,9 @@ function viewTrack(main) {
 function timerCard() {
   const r = S.st.running; const d = S.draft;
   if (r) {
-    const cs = catSelect("run-c", r.c), ps = prjSelect("run-p", r.p);
+    const ps = prjSelect("run-p", r.p), cs = catSelect("run-c", r.c, false, r.p);
     cs.addEventListener("change", () => { if (cs.value) { updateRunning({ c: cs.value }); render(); } });
-    ps.addEventListener("change", () => { if (ps.value) { updateRunning({ p: ps.value }); render(); } });
+    ps.addEventListener("change", () => { if (ps.value) { const c = pickForProject(ps.value, r.c) || r.c; updateRunning({ p: ps.value, c }); render(); } });
     const note = h("input", { type: "text", id: "run-note", maxlength: 2000, placeholder: "Комментарий к текущей работе", value: r.note || "" });
     note.addEventListener("input", () => updateRunning({ note: note.value.trim() }));
     note.addEventListener("keydown", ev => { if (ev.key === "Enter") note.blur(); });
@@ -332,18 +354,23 @@ function timerCard() {
       h("div", { class: "clockrow" },
         h("div", { class: "figure" }, clockEl(r.s), h("div", { class: "rule-total", role: "presentation" }), h("div", { class: "since" }, `в работе с ${fmtTime(r.s)}${dkey(r.s) !== dkey(Date.now()) ? ", " + fmtDayTitle(startOfDay(r.s)).toLowerCase() : ""}`)),
         h("button", { class: "btn big primary", id: "btn-stop", onclick: stopTimer }, "Остановить")),
-      h("div", { class: "picks" }, h("label", { class: "field" }, h("span", null, "категория активности"), cs), h("label", { class: "field" }, h("span", null, "проект"), ps)),
+      h("div", { class: "picks" }, h("label", { class: "field" }, h("span", null, "проект"), ps), h("label", { class: "field" }, h("span", null, "категория активности"), cs)),
       h("label", { class: "field" }, h("span", null, "комментарий"), note));
   }
   if (!d.c && S.st.last && cat(S.st.last.c) && !cat(S.st.last.c).archived) d.c = S.st.last.c;
   if (!d.p && S.st.last && prj(S.st.last.p) && !prj(S.st.last.p).archived) d.p = S.st.last.p;
   if (d.c && d.c !== "__new" && (!cat(d.c) || cat(d.c).archived)) d.c = "";
   if (d.p && d.p !== "__new" && (!prj(d.p) || prj(d.p).archived)) d.p = "";
-  const cs = catSelect("t-c", d.c, true), ps = prjSelect("t-p", d.p, true);
+  if (d.p && d.c && d.c !== "__new") d.c = pickForProject(d.p, d.c);
+  const ps = prjSelect("t-p", d.p, true), cs = catSelect("t-c", d.c, true, d.p);
   const newC = h("input", { type: "text", id: "t-newc", maxlength: 80, placeholder: "Название категории", value: d.newC, hidden: d.c !== "__new" });
   const newP = h("input", { type: "text", id: "t-newp", maxlength: 80, placeholder: "Название проекта", value: d.newP, hidden: d.p !== "__new" });
   cs.addEventListener("change", () => { d.c = cs.value; newC.hidden = d.c !== "__new"; if (!newC.hidden) newC.focus(); $("#timer-err").textContent = ""; });
-  ps.addEventListener("change", () => { d.p = ps.value; newP.hidden = d.p !== "__new"; if (!newP.hidden) newP.focus(); $("#timer-err").textContent = ""; });
+  ps.addEventListener("change", () => {
+    d.p = ps.value; newP.hidden = d.p !== "__new"; $("#timer-err").textContent = "";
+    d.c = pickForProject(d.p, d.c); fillCats(cs, d.p, d.c, true); newC.hidden = d.c !== "__new";
+    if (!newP.hidden) newP.focus(); else if (!d.c) cs.focus();
+  });
   newC.addEventListener("input", () => { d.newC = newC.value; });
   newP.addEventListener("input", () => { d.newP = newP.value; });
   const note = h("input", { type: "text", id: "t-note", maxlength: 2000, placeholder: "Необязательно — можно дописать позже", value: d.note });
@@ -351,8 +378,8 @@ function timerCard() {
   [newC, newP, note].forEach(x => x.addEventListener("keydown", ev => { if (ev.key === "Enter") { ev.preventDefault(); x.blur(); startTimer(); } }));
   return h("section", { class: "card timer", "aria-label": "Таймер" },
     h("div", { class: "picks" },
-      h("label", { class: "field" }, h("span", null, "категория активности"), cs, newC),
-      h("label", { class: "field" }, h("span", null, "проект"), ps, newP)),
+      h("label", { class: "field" }, h("span", null, "проект"), ps, newP),
+      h("label", { class: "field" }, h("span", null, "категория активности"), cs, newC)),
     h("label", { class: "field" }, h("span", null, "комментарий"), note),
     h("div", { class: "err", id: "timer-err" }),
     h("div", { class: "clockrow" },
@@ -366,10 +393,10 @@ function journal() {
   if (r) (byDay[dkey(r.s)] = byDay[dkey(r.s)] || []).push({ id: "__run", ...r, e: Date.now(), live: true });
   const keys = Object.keys(byDay).sort().reverse();
   const card = h("section", { class: "card", style: "display:grid;gap:18px" },
-    h("div", { class: "row" }, h("h2", { class: "grow" }, "Журнал"),
+    h("div", { class: "card-head" }, h("h2", null, "Журнал"),
       h("button", { class: "btn sm", onclick: openSettings }, "В Google Таблицу"),
       h("button", { class: "btn sm", id: "btn-add", onclick: () => openEditor(null) }, "+ Добавить вручную")));
-  if (!keys.length) card.append(h("p", { class: "muted" }, "Записей пока нет. Выберите категорию и проект выше и нажмите «Начать»."));
+  if (!keys.length) card.append(h("p", { class: "muted" }, "Записей пока нет. Выберите проект и категорию выше и нажмите «Начать»."));
   for (const k of keys.slice(0, S.shown)) {
     const list = byDay[k].sort((a, b) => b.s - a.s);
     const tot = list.filter(e => !e.live).reduce((t, e) => t + (e.e - e.s), 0);
@@ -393,7 +420,7 @@ function viewDict(main) {
   main.append(h("p", { class: "lead" }, "Архивные категории и проекты не удаляются: записи с ними остаются в журнале, а в списках выбора они больше не показываются. Вернуть из архива можно в любой момент."));
   main.append(h("div", { class: "dict" },
     dictCard({ title: "Категории активностей", hint: "Что вы делаете: созвон, анализ отчётности, подготовка лекции.", list: S.st.categories, kind: "c", create: createCategory, placeholder: "Новая категория" }),
-    dictCard({ title: "Проекты", hint: "Для чего работаете: клиент, направление, сфера жизни. Цвет проекта отмечает записи в журнале.", list: S.st.projects, kind: "p", create: createProject, placeholder: "Новый проект" })));
+    dictCard({ title: "Проекты", hint: "Для чего работаете: клиент, направление, сфера жизни. У каждого проекта можно выбрать его активности — при запуске таймера покажутся только они.", list: S.st.projects, kind: "p", create: createProject, placeholder: "Новый проект" })));
 }
 function dictCard({ title, hint, list, kind, create, placeholder }) {
   const act = active(list), arch = archived(list);
@@ -418,7 +445,7 @@ function dictCard({ title, hint, list, kind, create, placeholder }) {
       x.name = v; err.textContent = ""; saveState();
     });
     const move = dir => { const j = i + dir; if (j < 0 || j >= act.length) return; [act[i], act[j]] = [act[j], act[i]]; act.forEach((y, n) => (y.order = n)); saveState(); render(); };
-    items.append(h("div", { class: "li" },
+    const row = h("div", { class: "li" },
       kind === "p" && h("button", { class: "swatch", style: `--c:${x.color}`, "aria-label": "Цвет проекта", title: "Сменить цвет", onclick: () => pickColor(x) }),
       name,
       h("button", { class: "iconbtn", "aria-label": "Выше", disabled: i === 0, onclick: () => move(-1) }, "↑"),
@@ -427,7 +454,13 @@ function dictCard({ title, hint, list, kind, create, placeholder }) {
         x.archived = true; saveState(); render();
         toast(`«${x.name}» в архиве`, () => { x.archived = false; saveState(); render(); });
       } }, h("span", { class: "arch-label" }, "В архив"),
-        archIcon())));
+        archIcon()));
+    if (kind === "p") {
+      const own = (x.cats || []).filter(id => cat(id) && !cat(id).archived);
+      items.append(h("div", { class: "li-wrap" }, row, h("div", { class: "li-sub" },
+        h("span", null, own.length ? `активности: ${own.map(id => cName(id)).slice(0, 3).join(", ")}${own.length > 3 ? ` и ещё ${own.length - 3}` : ""}` : "активности: все"),
+        h("button", { onclick: () => pickProjectCats(x) }, own.length ? "изменить" : "выбрать"))));
+    } else items.append(row);
   });
   const archBox = arch.length ? h("details", { class: "arch", open: S["open-" + kind] || null, ontoggle: ev => { S["open-" + kind] = ev.currentTarget.open; } },
     h("summary", null, `В архиве: ${arch.length}`),
@@ -439,11 +472,131 @@ function dictCard({ title, hint, list, kind, create, placeholder }) {
         x.archived = false; x.order = act.length; saveState(); render();
       } }, "Вернуть"))))) : null;
   return h("section", { class: "card" },
-    h("h2", null, title), h("p", { class: "note" }, hint),
+    kind === "c" ? h("div", { class: "card-head" }, h("h2", null, title), h("button", { class: "btn sm", id: "btn-import", onclick: openImport }, "Загрузить списком")) : h("h2", null, title),
+    h("p", { class: "note" }, hint),
     h("div", { class: "addrow" }, add, h("button", { class: "btn", onclick: doAdd }, "Добавить")), err,
     act.length ? items : h("p", { class: "muted", style: "font-size:14px" }, "Список пуст."),
     archBox);
 }
+function pickProjectCats(p) {
+  const all = active(S.st.categories);
+  if (!all.length) { toast("Сначала добавьте категории активностей"); return; }
+  const chosen = new Set((p.cats || []).filter(id => cat(id) && !cat(id).archived));
+  const boxes = all.map(c => { const cb = h("input", { type: "checkbox", value: c.id }); cb.checked = chosen.has(c.id); return h("label", null, cb, h("span", null, c.name)); });
+  const setAll = v => boxes.forEach(l => (l.firstChild.checked = v));
+  const close = openModal(`Активности: ${p.name}`, h("div", { style: "display:grid;gap:12px" },
+    h("p", { class: "note" }, "Отметьте, какие активности показывать при выборе этого проекта. Если ничего не отмечено — показываются все."),
+    h("div", { class: "row" }, h("button", { class: "btn sm ghost", onclick: () => setAll(true) }, "Отметить все"), h("button", { class: "btn sm ghost", onclick: () => setAll(false) }, "Снять все")),
+    h("div", { class: "checks" }, boxes)), [
+    h("span", { class: "sp" }), h("button", { class: "btn ghost", onclick: () => close() }, "Отмена"),
+    h("button", { class: "btn primary", id: "pc-save", onclick: () => {
+      const ids = boxes.filter(l => l.firstChild.checked).map(l => l.firstChild.value);
+      // archived activities that were linked before stay linked, so returning them from the archive restores the list
+      const keepArchived = (p.cats || []).filter(id => cat(id)?.archived);
+      p.cats = ids.length === all.length ? [] : [...ids, ...keepArchived];
+      if (!ids.length) p.cats = [];
+      saveState(); close(); render();
+      toast(p.cats.length ? `У проекта «${p.name}» ${ids.length} ${plural(ids.length, "активность", "активности", "активностей")}` : `У проекта «${p.name}» показываются все активности`);
+    } }, "Сохранить")]);
+}
+const plural = (n, one, few, many) => { const a = Math.abs(n) % 100, b = a % 10; return a > 10 && a < 20 ? many : b === 1 ? one : b >= 2 && b <= 4 ? few : many; };
+
+/* ---------- import a list of activities ----------
+   One activity per line. A second column (tab or «;» from Excel / Google Sheets, or a .csv column)
+   may name projects, separated by commas: the activity is then linked to them. */
+function parseImport(text, isCsv) {
+  const out = new Map();
+  const lines = String(text).replace(/^\ufeff/, "").split(/\r?\n/).slice(0, 2000);
+  const unq = s => s.trim().replace(/^"(.*)"$/s, "$1").replace(/""/g, '"').trim();
+  lines.forEach((line, i) => {
+    if (!line.trim()) return;
+    let cols;
+    if (line.includes("\t")) cols = line.split("\t");
+    else if (line.includes(";")) cols = line.split(";");
+    else if (isCsv && line.includes(",")) cols = line.split(",");
+    else cols = [line];
+    cols = cols.map(unq);
+    const name = cols[0].slice(0, 80); if (!name) return;
+    if (i === 0 && /^(категори|активност|вид|название)/i.test(name) && (cols.length === 1 || /проект/i.test(cols[1] || ""))) return;
+    const projects = cols.slice(1).join(",").split(",").map(s => s.trim().slice(0, 80)).filter(Boolean);
+    const key = name.toLowerCase();
+    const prev = out.get(key);
+    if (prev) projects.forEach(x => prev.projects.includes(x) || prev.projects.push(x));
+    else out.set(key, { name, projects });
+  });
+  return [...out.values()].slice(0, 500);
+}
+function importPlan(items) {
+  const plan = { add: [], exists: [], unarchive: [], newProjects: new Set(), links: 0, archivedProjects: new Set() };
+  for (const it of items) {
+    const ex = sameName(S.st.categories, it.name);
+    if (!ex) plan.add.push(it.name); else if (ex.archived) plan.unarchive.push(ex.name); else plan.exists.push(ex.name);
+    for (const pn of it.projects) {
+      const p = sameName(S.st.projects, pn);
+      if (!p) plan.newProjects.add(pn); else if (p.archived) { plan.archivedProjects.add(p.name); continue; }
+      plan.links++;
+    }
+  }
+  return plan;
+}
+function applyImport(items) {
+  for (const it of items) {
+    const cid = createCategory(it.name);
+    for (const pn of it.projects) {
+      const ex = sameName(S.st.projects, pn);
+      if (ex && ex.archived) continue;
+      const pid = ex ? ex.id : createProject(pn);
+      const p = prj(pid); if (!p.cats.includes(cid)) p.cats.push(cid);
+    }
+  }
+  saveState();
+}
+function openImport() {
+  const ta = h("textarea", { id: "imp-text", style: "min-height:160px", placeholder: "Созвон\nАнализ отчётности\nПодготовка выступления; Личный бренд\nПосты; Личный бренд, Выступления" });
+  const file = h("input", { type: "file", id: "imp-file", accept: ".txt,.csv,text/plain,text/csv", hidden: true });
+  const preview = h("div", { class: "preview", role: "status" });
+  const go = h("button", { class: "btn primary", id: "imp-go", disabled: true }, "Добавить");
+  let isCsv = false, items = [];
+  const update = () => {
+    items = parseImport(ta.value, isCsv); const pl = importPlan(items); preview.innerHTML = "";
+    go.disabled = !items.length;
+    if (!items.length) { preview.append(h("p", { class: "note" }, "Вставьте список или выберите файл — здесь появится, что будет добавлено.")); return; }
+    const facts = [
+      pl.add.length && `новых активностей: ${pl.add.length}`,
+      pl.unarchive.length && `вернутся из архива: ${pl.unarchive.length}`,
+      pl.exists.length && `уже есть: ${pl.exists.length}`,
+      pl.links && `привязок к проектам: ${pl.links}`,
+      pl.newProjects.size && `новых проектов: ${pl.newProjects.size} (${[...pl.newProjects].slice(0, 3).join(", ")}${pl.newProjects.size > 3 ? "…" : ""})`,
+    ].filter(Boolean);
+    preview.append(h("p", null, h("b", null, facts.join(" · "))));
+    if (pl.links) preview.append(h("p", { class: "note" }, "У проектов из второго столбца при выборе будут показываться только привязанные к ним активности."));
+    if (pl.archivedProjects.size) preview.append(h("p", { class: "note" }, `Проекты в архиве пропущены: ${[...pl.archivedProjects].join(", ")}.`));
+    preview.append(h("ul", null, items.slice(0, 50).map(it => h("li", null, it.name, it.projects.length ? ` → ${it.projects.join(", ")}` : ""))));
+    if (items.length > 50) preview.append(h("p", { class: "note" }, `и ещё ${items.length - 50}`));
+  };
+  ta.addEventListener("input", () => { isCsv = false; update(); });
+  file.addEventListener("change", () => {
+    const f = file.files[0]; file.value = ""; if (!f) return;
+    if (/\.(xlsx?|ods|numbers)$/i.test(f.name)) { preview.innerHTML = ""; preview.append(h("p", { class: "err" }, "Файлы Excel напрямую не читаются. Сохраните таблицу как CSV (Файл → Сохранить как → CSV) или просто скопируйте столбец и вставьте сюда.")); return; }
+    if (f.size > 1024 * 1024) { preview.innerHTML = ""; preview.append(h("p", { class: "err" }, "Файл слишком большой для списка активностей.")); return; }
+    const read = enc => new Promise(res => { const r = new FileReader(); r.onload = () => res(String(r.result)); r.readAsText(f, enc); });
+    read("utf-8").then(async txt => { if (txt.includes("\ufffd")) txt = await read("windows-1251"); isCsv = /\.csv$/i.test(f.name); ta.value = txt; update(); });
+  });
+  const close = openModal("Загрузить активности списком", h("div", { style: "display:grid;gap:14px" },
+    h("p", { class: "note" }, "По одной активности в строке. Можно скопировать столбец из Excel или Google Таблицы и вставить сюда. Чтобы сразу привязать активность к проектам, укажите их во втором столбце (или через «;»), несколько — через запятую."),
+    h("label", { class: "field" }, h("span", null, "список"), ta),
+    h("div", { class: "row" }, h("button", { class: "btn sm", onclick: () => file.click() }, "Выбрать файл (.txt, .csv)"), file),
+    preview), [
+    h("span", { class: "sp" }), h("button", { class: "btn ghost", onclick: () => close() }, "Отмена"),
+    go]);
+  go.addEventListener("click", () => {
+    if (!items.length) return;
+    const pl = importPlan(items); applyImport(items); close(); render();
+    toast(`Готово: ${pl.add.length} ${plural(pl.add.length, "новая активность", "новые активности", "новых активностей")}` + (pl.links ? `, привязок к проектам: ${pl.links}` : ""));
+  });
+  update();
+}
+
 function archIcon() {
   const span = h("span", { class: "arch-icon", "aria-hidden": "true", style: "display:inline-grid" });
   span.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"><rect x="3.5" y="4.5" width="17" height="4" rx="1"/><path d="M5 8.5v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-10M10 12.5h4"/></svg>';
@@ -608,7 +761,7 @@ function sumBy(list, key) { const m = {}; for (const e of list) m[e[key]] = (m[e
 function viewReports(main) {
   const sec = h("section", { class: "stack" });
   const [from, to] = repRange();
-  const seg = h("div", { class: "seg", role: "group", "aria-label": "Период" }, [["week", "Неделя"], ["month", "Месяц"], ["lastmonth", "Прошлый"], ["custom", "Период"]].map(([k, l]) =>
+  const seg = h("div", { class: "seg", role: "group", "aria-label": "Период" }, [["week", "Неделя"], ["month", "Месяц"], ["lastmonth", "Прошлый месяц"], ["custom", "Период"]].map(([k, l]) =>
     h("button", { "aria-pressed": S.rep.period === k ? "true" : "false", onclick: () => { S.rep.period = k; render(); } }, l)));
   const tools = h("div", { class: "toolbar" }, h("div", { class: "field" }, h("span", null, "период"), seg));
   if (S.rep.period === "custom") {
